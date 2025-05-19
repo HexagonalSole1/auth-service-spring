@@ -53,15 +53,6 @@ public class SecurityConfig {
                                 .requestMatchers(HttpMethod.POST, "auth/authenticate").permitAll()
                                 .requestMatchers(HttpMethod.POST, "auth/refresh-token").permitAll()
                                 .requestMatchers("/roles/**").hasRole("ADMIN")
-                                .requestMatchers("jobs/**").permitAll()
-                                .requestMatchers("job-applications/**").permitAll()
-                                .requestMatchers("notifications/**").permitAll()
-                                .requestMatchers("notificationsLog/**").permitAll()
-                                .requestMatchers("/uploads/**").permitAll()
-                                // Nuevos endpoints para el diario emocional
-                                .requestMatchers("/emotions/**").authenticated()
-                                .requestMatchers("/emotion-records/**").authenticated()
-                                .requestMatchers("/notes/**").authenticated()
                                 .anyRequest().authenticated()
                 );
 
