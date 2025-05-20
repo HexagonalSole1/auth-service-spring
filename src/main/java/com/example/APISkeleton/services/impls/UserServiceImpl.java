@@ -10,6 +10,7 @@ import com.example.APISkeleton.persistance.repositories.IUserRoleRepository;
 import com.example.APISkeleton.services.IUserService;
 import com.example.APISkeleton.web.dtos.requests.CreateUserRequest;
 import com.example.APISkeleton.web.dtos.responses.BaseResponse;
+import com.example.APISkeleton.web.dtos.responses.InfoUserResponse;
 import com.example.APISkeleton.web.exceptions.ConflictException;
 import com.example.APISkeleton.web.exceptions.ResourceNotFoundException;
 import org.springframework.http.HttpStatus;
@@ -83,6 +84,25 @@ public class UserServiceImpl implements IUserService {
         return BaseResponse.builder()
                 .data(userMapper.toCreateUserResponse(user))
                 .message("User created successfully with roles: " + rolesToAssign)
+                .success(true)
+                .httpStatus(HttpStatus.CREATED)
+                .build();
+    }
+
+    @Override
+    public BaseResponse getUserInfo(String email) {
+
+        User user = getByEmail(email);
+
+       InfoUserResponse infoUserResponse =  InfoUserResponse.builder().id(user.getId())
+                .name(user.getName())
+                .email(user.getEmail())
+                .username(user.getUsername())
+                .build();
+
+        return BaseResponse.builder()
+                .data(infoUserResponse)
+                .message("UserInfo Get successfully" )
                 .success(true)
                 .httpStatus(HttpStatus.CREATED)
                 .build();

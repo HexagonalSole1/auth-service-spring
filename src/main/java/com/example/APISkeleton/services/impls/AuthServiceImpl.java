@@ -47,11 +47,17 @@ public class AuthServiceImpl implements IAuthService {
         if (!passwordEncoder.matches(request.getPassword(), user.getPassword())) {
             throw new InvalidCredentialsException();
         }
-
-        // 🔹 Crear claims para el JWT (incluye ID y email)
+// Nuevo código para obtener roles
+        String rolesString = (user.getUserRoles() != null) ?
+                user.getUserRoles().stream()
+                        .map(userRole -> userRole.getRole().getName())
+                        .collect(Collectors.joining(",")) : "";
+// ✅ DESPUÉS
         Map<String, Object> claims = Map.of(
                 "id", user.getId(),
-                "email", user.getEmail()
+                "email", user.getEmail(),
+                "username", user.getUsername() != null ? user.getUsername() : user.getEmail(),
+                "roles", rolesString  // "USER,ADMIN" format
         );
 
         // 🔹 Generar tokens JWT

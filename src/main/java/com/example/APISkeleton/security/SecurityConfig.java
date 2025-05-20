@@ -53,6 +53,9 @@ public class SecurityConfig {
                                 .requestMatchers(HttpMethod.POST, "auth/authenticate").permitAll()
                                 .requestMatchers(HttpMethod.POST, "auth/refresh-token").permitAll()
                                 .requestMatchers("/roles/**").hasRole("ADMIN")
+                                .requestMatchers("/users/**").permitAll()
+                                .requestMatchers("/users/user/email/").permitAll()
+                                .requestMatchers("/users/user/**").permitAll()
                                 .anyRequest().authenticated()
                 );
 
