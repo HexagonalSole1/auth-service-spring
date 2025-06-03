@@ -233,7 +233,7 @@ pipeline {
             when {
                 allOf {
                     not { environment name: 'DEPLOY_STRATEGY', value: 'skip' }
-                    not { params.SKIP_TESTS }
+                    expression { !params.SKIP_TESTS }  // ← CORREGIDO
                 }
             }
             steps {
