@@ -50,8 +50,8 @@ pipeline {
 
     environment {
         // ✅ INICIALIZACIÓN DE VARIABLES
-        BRANCH_NAME = "${env.GIT_BRANCH?.replaceAll('origin/', '') ?: env.BRANCH_NAME ?: 'dev'}"
-        ENV = "${env.BRANCH_NAME == 'main' ? 'prod' : env.BRANCH_NAME ?: 'dev'}"
+        BRANCH_NAME = "${sh(script: 'git rev-parse --abbrev-ref HEAD 2>/dev/null || echo dev', returnStdout: true).trim()}"
+        ENV = "${BRANCH_NAME == 'main' ? 'prod' : BRANCH_NAME}"
 
         // Configuración de servidores EC2
         EC2_USER = 'ubuntu'
@@ -69,8 +69,9 @@ pipeline {
         CALCULATED_SERVICE_NAME = "${params.SERVICE_NAME ?: 'auth-service'}"
         CALCULATED_JAR_NAME = "${params.SERVICE_NAME ?: 'auth-service'}-0.0.1-SNAPSHOT.jar"
         CALCULATED_SERVICE_PATH = "${params.SERVICE_PATH ?: '/home/ubuntu/auth-service'}"
-        DEPLOY_STRATEGY = "compile-only"
-        TARGET_ENV = "none"
+        DEPLOY_STRATEGY = "${BRANCH_NAME == 'dev' ? 'auto' : (BRANCH_NAME == 'qa' ? 'auto' : (BRANCH_NAME == 'main' ? 'manual-approval' : 'compile-only'))}"
+        TARGET_ENV = "${BRANCH_NAME == 'dev' ? 'dev' : (BRANCH_NAME == 'qa' ? 'qa' : (BRANCH_NAME == 'main' ? 'prod' : 'none'))}"
+
     }
 
     stages {
