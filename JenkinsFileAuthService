@@ -24,7 +24,7 @@ pipeline {
         )
         string(
             name: 'JAR_NAME',
-            defaultValue: 'auth-service-0.0.1-SNAPSHOT.jar',
+            defaultValue: 'discoveryService-0.0.1-SNAPSHOT.jar',
             description: 'Nombre del archivo JAR'
         )
         choice(
