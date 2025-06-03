@@ -2,7 +2,7 @@ spring:
   application:
     name: auth-service
   profiles:
-    active: dev
+    active: qa
 
   config:
     import: configserver:http://34.239.38.109:8888
