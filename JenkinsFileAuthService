@@ -1,7 +1,3 @@
-// ==========================================
-// JENKINSFILE PARA AUTH-SERVICE
-// ==========================================
-
 pipeline {
     agent any
 
@@ -24,242 +20,109 @@ pipeline {
         string(
             name: 'SERVICE_NAME',
             defaultValue: 'auth-service',
-            description: 'Nombre del microservicio. Por defecto: auth-service'
+            description: 'Nombre del microservicio'
         )
         string(
             name: 'JAR_NAME',
-            defaultValue: '',
-            description: 'Nombre del archivo JAR. Si está vacío, se detecta automáticamente.'
+            defaultValue: 'auth-service-0.0.1-SNAPSHOT.jar',
+            description: 'Nombre del archivo JAR'
         )
-        string(
-            name: 'SERVICE_PATH',
-            defaultValue: '',
-            description: 'Ruta personalizada en el servidor. Si está vacío, usa /home/ubuntu/[SERVICE_NAME]'
+        choice(
+            name: 'TARGET_ENVIRONMENT',
+            choices: ['AUTO', 'dev', 'qa', 'prod', 'none'],
+            description: 'Entorno de despliegue (AUTO=Según rama, none=Sin despliegue)'
         )
         choice(
             name: 'JAVA_VERSION',
             choices: ['17', '21', '11'],
-            description: 'Versión de Java a usar (por defecto: 17 para auth-service)'
+            description: 'Versión de Java a usar'
         )
         booleanParam(
-            name: 'FORCE_DEPLOY',
-            defaultValue: false,
-            description: 'Forzar deploy incluso en ramas de feature'
+            name: 'SKIP_TESTS',
+            defaultValue: true,
+            description: 'Omitir ejecución de tests'
         )
     }
 
     environment {
-        // ✅ INICIALIZACIÓN DE VARIABLES
-        BRANCH_NAME = "${sh(script: 'git rev-parse --abbrev-ref HEAD 2>/dev/null || echo dev', returnStdout: true).trim()}"
-        ENV = "${BRANCH_NAME == 'main' ? 'prod' : BRANCH_NAME}"
-
-        // Configuración de servidores EC2
+        // Servidores por entorno
         EC2_USER = 'ubuntu'
         EC2_IP_DEV = '23.22.115.242'
         EC2_IP_QA = '3.220.122.151'
         EC2_IP_PROD = '34.224.192.38'
 
-        // Credenciales y herramientas
+        // Configuración de Java
+        JDK_DIR = "${WORKSPACE}/jdk${params.JAVA_VERSION}"
+        JAVA_HOME = "${JDK_DIR}"
+        PATH = "${JDK_DIR}/bin:${PATH}"
+
+        // Credenciales
         SSH_KEY = credentials('ssh-key-ec2')
-        JDK_DIR = "${WORKSPACE}/jdk${params.JAVA_VERSION ?: '17'}"
-        JAVA_HOME = "${WORKSPACE}/jdk${params.JAVA_VERSION ?: '17'}"
-        PATH = "${WORKSPACE}/jdk${params.JAVA_VERSION ?: '17'}/bin:${PATH}"
 
-        // ✅ INICIALIZACIÓN DE VARIABLES CALCULADAS
-        CALCULATED_SERVICE_NAME = "${params.SERVICE_NAME ?: 'auth-service'}"
-        CALCULATED_JAR_NAME = "${params.SERVICE_NAME ?: 'auth-service'}-0.0.1-SNAPSHOT.jar"
-        CALCULATED_SERVICE_PATH = "${params.SERVICE_PATH ?: '/home/ubuntu/auth-service'}"
-        DEPLOY_STRATEGY = "${BRANCH_NAME == 'dev' ? 'auto' : (BRANCH_NAME == 'qa' ? 'auto' : (BRANCH_NAME == 'main' ? 'manual-approval' : 'compile-only'))}"
-        TARGET_ENV = "${BRANCH_NAME == 'dev' ? 'dev' : (BRANCH_NAME == 'qa' ? 'qa' : (BRANCH_NAME == 'main' ? 'prod' : 'none'))}"
-
+        // Variables para auth-service
+        AUTH_SERVICE_NAME = "${params.SERVICE_NAME}"
+        AUTH_JAR_NAME = "${params.JAR_NAME}"
+        AUTH_SERVICE_PATH = "/home/ubuntu/${params.SERVICE_NAME}"
     }
 
     stages {
-        stage('🔍 Auto-Detection & Setup') {
+        stage('🔧 Detectar Entorno') {
             steps {
                 script {
-                    echo "🔍 [AUTH-SERVICE] Iniciando detección automática..."
+                    // Obtener información de la rama
+                    env.GIT_BRANCH_NAME = sh(script: 'git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown', returnStdout: true).trim()
 
-                    try {
-                        // 1. Detección del nombre del servicio
-                        if (params.SERVICE_NAME && params.SERVICE_NAME.trim()) {
-                            env.CALCULATED_SERVICE_NAME = params.SERVICE_NAME.trim()
-                            echo "✅ [AUTH-SERVICE] Nombre del servicio (parámetro): ${env.CALCULATED_SERVICE_NAME}"
+                    // Mostrar información de diagnóstico
+                    echo "🔍 [DEBUG] Git branch: ${env.GIT_BRANCH_NAME}"
+                    echo "🔍 [DEBUG] Jenkins GIT_BRANCH: ${env.GIT_BRANCH ?: 'no definido'}"
+                    echo "🔍 [DEBUG] Jenkins BRANCH_NAME: ${env.BRANCH_NAME ?: 'no definido'}"
+
+                    // Determinar entorno basado en parámetro o rama
+                    if (params.TARGET_ENVIRONMENT == 'AUTO') {
+                        if (env.GIT_BRANCH_NAME == 'main' || env.GIT_BRANCH_NAME.startsWith('main/') ||
+                            env.BRANCH_NAME == 'main' || (env.GIT_BRANCH && env.GIT_BRANCH.contains('main'))) {
+                            env.DEPLOY_ENV = 'prod'
+                            env.NEED_APPROVAL = 'true'
+                        } else if (env.GIT_BRANCH_NAME == 'qa' || env.GIT_BRANCH_NAME.startsWith('qa/') ||
+                                  env.BRANCH_NAME == 'qa' || (env.GIT_BRANCH && env.GIT_BRANCH.contains('qa'))) {
+                            env.DEPLOY_ENV = 'qa'
+                            env.NEED_APPROVAL = 'false'
+                        } else if (env.GIT_BRANCH_NAME == 'dev' || env.GIT_BRANCH_NAME.startsWith('dev/') ||
+                                  env.BRANCH_NAME == 'dev' || (env.GIT_BRANCH && env.GIT_BRANCH.contains('dev')) ||
+                                  env.GIT_BRANCH_NAME == 'HEAD') {
+                            env.DEPLOY_ENV = 'dev'
+                            env.NEED_APPROVAL = 'false'
                         } else {
-                            echo "🔍 [AUTH-SERVICE] Detectando servicio desde pom.xml..."
-
-                            try {
-                                def pomDetection = sh(
-                                    script: '''
-                                        if [ ! -f "pom.xml" ]; then
-                                            echo ""
-                                            exit 0
-                                        fi
-
-                                        # Método simple con grep
-                                        ARTIFACT_ID=$(grep -A1 -B1 "<artifactId>" pom.xml | grep -v "parent" | grep -v "spring-boot-starter-parent" | grep "<artifactId>" | head -1 | sed 's/.*<artifactId>//g' | sed 's/<.*//g' | tr -d ' \\t' | head -1)
-
-                                        if [ -n "$ARTIFACT_ID" ] && [ "$ARTIFACT_ID" != "" ]; then
-                                            echo "$ARTIFACT_ID"
-                                        else
-                                            # Fallback más simple
-                                            grep "<artifactId>" pom.xml | head -2 | tail -1 | sed 's/.*<artifactId>//g' | sed 's/<.*//g' | tr -d ' \\t' || echo ""
-                                        fi
-                                    ''',
-                                    returnStdout: true
-                                ).trim()
-
-                                echo "🔍 [AUTH-SERVICE] Detección desde pom.xml: '${pomDetection}'"
-
-                                if (pomDetection && pomDetection != "") {
-                                    env.CALCULATED_SERVICE_NAME = pomDetection
-                                    echo "✅ [AUTH-SERVICE] Servicio detectado desde pom.xml: ${env.CALCULATED_SERVICE_NAME}"
-                                } else {
-                                    // Fallback: detectar desde clase principal
-                                    def classDetection = sh(
-                                        script: '''
-                                            APP_CLASS=$(find src/main/java -name "*Application.java" 2>/dev/null | head -1 | xargs basename -s .java 2>/dev/null || echo "")
-                                            if [ -n "$APP_CLASS" ]; then
-                                                echo "$APP_CLASS" | sed 's/Application$//' | tr '[:upper:]' '[:lower:]'
-                                            else
-                                                echo "auth-service"
-                                            fi
-                                        ''',
-                                        returnStdout: true
-                                    ).trim()
-
-                                    env.CALCULATED_SERVICE_NAME = classDetection
-                                    echo "✅ [AUTH-SERVICE] Servicio detectado desde clase: ${env.CALCULATED_SERVICE_NAME}"
-                                }
-
-                            } catch (Exception e) {
-                                echo "⚠️ [AUTH-SERVICE] Error en detección automática: ${e.message}"
-                                env.CALCULATED_SERVICE_NAME = "auth-service"
-                            }
+                            env.DEPLOY_ENV = 'none'
+                            env.NEED_APPROVAL = 'false'
                         }
-
-                        // ✅ LIMPIAR Y VALIDAR NOMBRE DEL SERVICIO
-                        if (env.CALCULATED_SERVICE_NAME && env.CALCULATED_SERVICE_NAME != "") {
-                            env.CALCULATED_SERVICE_NAME = env.CALCULATED_SERVICE_NAME.replaceAll('[^a-zA-Z0-9-_]', '-').toLowerCase()
-                            if (env.CALCULATED_SERVICE_NAME.length() > 50) {
-                                env.CALCULATED_SERVICE_NAME = env.CALCULATED_SERVICE_NAME.substring(0, 50)
-                            }
-                            if (env.CALCULATED_SERVICE_NAME.startsWith("-")) {
-                                env.CALCULATED_SERVICE_NAME = env.CALCULATED_SERVICE_NAME.substring(1)
-                            }
-                            if (env.CALCULATED_SERVICE_NAME.endsWith("-")) {
-                                env.CALCULATED_SERVICE_NAME = env.CALCULATED_SERVICE_NAME.substring(0, env.CALCULATED_SERVICE_NAME.length() - 1)
-                            }
-                            if (env.CALCULATED_SERVICE_NAME == "" || env.CALCULATED_SERVICE_NAME == "-") {
-                                env.CALCULATED_SERVICE_NAME = "auth-service"
-                            }
-                        } else {
-                            env.CALCULATED_SERVICE_NAME = "auth-service"
-                        }
-
-                        echo "✅ [AUTH-SERVICE] Nombre final del servicio: ${env.CALCULATED_SERVICE_NAME}"
-
-                        // 2. Calcular nombre del JAR
-                        if (params.JAR_NAME && params.JAR_NAME.trim()) {
-                            env.CALCULATED_JAR_NAME = params.JAR_NAME.trim()
-                        } else {
-                            env.CALCULATED_JAR_NAME = "${env.CALCULATED_SERVICE_NAME}-0.0.1-SNAPSHOT.jar"
-                        }
-                        echo "📦 [AUTH-SERVICE] JAR esperado: ${env.CALCULATED_JAR_NAME}"
-
-                        // 3. Calcular ruta del servicio
-                        if (params.SERVICE_PATH && params.SERVICE_PATH.trim()) {
-                            env.CALCULATED_SERVICE_PATH = params.SERVICE_PATH.trim()
-                        } else {
-                            env.CALCULATED_SERVICE_PATH = "/home/ubuntu/${env.CALCULATED_SERVICE_NAME}"
-                        }
-                        echo "📁 [AUTH-SERVICE] Ruta del servicio: ${env.CALCULATED_SERVICE_PATH}"
-
-                        // 4. Validación de estructura
-                        echo "🔍 [AUTH-SERVICE] Validando estructura del proyecto..."
-                        try {
-                            def pomExists = sh(
-                                script: "[ -f pom.xml ] && echo 'true' || echo 'false'",
-                                returnStdout: true
-                            ).trim()
-
-                            def mainClassCount = sh(
-                                script: "find src/main/java -name '*Application.java' 2>/dev/null | wc -l || echo '0'",
-                                returnStdout: true
-                            ).trim()
-
-                            echo "✅ [AUTH-SERVICE] pom.xml existe: ${pomExists}"
-                            echo "✅ [AUTH-SERVICE] Clases *Application.java encontradas: ${mainClassCount}"
-
-                        } catch (Exception e) {
-                            echo "⚠️ [AUTH-SERVICE] Error validando estructura: ${e.message}"
-                        }
-
-                        // 5. ✅ DETERMINAR ESTRATEGIA DE DEPLOY
-                        def currentBranch = env.BRANCH_NAME ?: 'dev'
-                        echo "🔍 [AUTH-SERVICE] Rama actual: ${currentBranch}"
-                        echo "🔍 [AUTH-SERVICE] Parámetro FORCE_DEPLOY: ${params.FORCE_DEPLOY}"
-
-                        if (params.FORCE_DEPLOY == true) {
-                            echo "🚀 [AUTH-SERVICE] ESTRATEGIA: Deploy forzado"
-                            env.DEPLOY_STRATEGY = 'auto'
-                            env.TARGET_ENV = (currentBranch == 'main') ? 'prod' : (currentBranch == 'qa') ? 'qa' : 'dev'
-                        } else if (currentBranch == 'dev') {
-                            echo "🚀 [AUTH-SERVICE] ESTRATEGIA: Deploy automático a DEV"
-                            env.DEPLOY_STRATEGY = 'auto'
-                            env.TARGET_ENV = 'dev'
-                        } else if (currentBranch == 'qa') {
-                            echo "🔄 [AUTH-SERVICE] ESTRATEGIA: Deploy automático a QA"
-                            env.DEPLOY_STRATEGY = 'auto'
-                            env.TARGET_ENV = 'qa'
-                        } else if (currentBranch == 'main') {
-                            echo "⚠️ [AUTH-SERVICE] ESTRATEGIA: Aprobación manual + Deploy a PROD"
-                            env.DEPLOY_STRATEGY = 'manual-approval'
-                            env.TARGET_ENV = 'prod'
-                        } else {
-                            echo "✏️ [AUTH-SERVICE] ESTRATEGIA: Solo compilación (rama: ${currentBranch})"
-                            env.DEPLOY_STRATEGY = 'compile-only'
-                            env.TARGET_ENV = 'none'
-                        }
-
-                        echo """
-🎯 [AUTH-SERVICE] CONFIGURACIÓN FINAL:
-   • Servicio: ${env.CALCULATED_SERVICE_NAME}
-   • JAR: ${env.CALCULATED_JAR_NAME}
-   • Ruta: ${env.CALCULATED_SERVICE_PATH}
-   • Rama: ${currentBranch}
-   • Entorno: ${env.TARGET_ENV}
-   • Estrategia: ${env.DEPLOY_STRATEGY}
-   • Java: ${params.JAVA_VERSION ?: '17'}
-   • Tests: DESHABILITADOS (solo compilación y deploy)
-   • Puerto: Configurado en Config Server
-"""
-
-                    } catch (Exception e) {
-                        echo "❌ [AUTH-SERVICE] Error crítico en configuración: ${e.message}"
-                        e.printStackTrace()
-
-                        // ✅ CONFIGURACIÓN DE EMERGENCIA
-                        env.CALCULATED_SERVICE_NAME = "auth-service"
-                        env.CALCULATED_JAR_NAME = "auth-service-0.0.1-SNAPSHOT.jar"
-                        env.CALCULATED_SERVICE_PATH = "/home/ubuntu/auth-service"
-                        env.DEPLOY_STRATEGY = "compile-only"
-                        env.TARGET_ENV = "none"
-
-                        echo "🆘 [AUTH-SERVICE] Usando configuración de emergencia"
-                        error("Error en configuración inicial")
+                    } else if (params.TARGET_ENVIRONMENT == 'none') {
+                        env.DEPLOY_ENV = 'none'
+                        env.NEED_APPROVAL = 'false'
+                    } else {
+                        env.DEPLOY_ENV = params.TARGET_ENVIRONMENT
+                        env.NEED_APPROVAL = params.TARGET_ENVIRONMENT == 'prod' ? 'true' : 'false'
                     }
+
+                    // Mostrar configuración final
+                    echo """
+🔧 [AUTH-SERVICE] CONFIGURACIÓN:
+   • Servicio: ${env.AUTH_SERVICE_NAME}
+   • JAR: ${env.AUTH_JAR_NAME}
+   • Rama detectada: ${env.GIT_BRANCH_NAME}
+   • Entorno de despliegue: ${env.DEPLOY_ENV}
+   • Requiere aprobación: ${env.NEED_APPROVAL}
+   • Java: ${params.JAVA_VERSION}
+   • Omitir tests: ${params.SKIP_TESTS}
+"""
                 }
             }
         }
 
         stage('🔧 Setup JDK') {
-            when {
-                not { environment name: 'DEPLOY_STRATEGY', value: 'skip' }
-            }
             steps {
                 script {
-                    def javaVersion = params.JAVA_VERSION ?: '17'
+                    def javaVersion = params.JAVA_VERSION
                     def downloadUrl = ""
 
                     switch(javaVersion) {
@@ -297,156 +160,76 @@ pipeline {
             }
         }
 
-        stage('🔨 Build Application') {
-            when {
-                not { environment name: 'DEPLOY_STRATEGY', value: 'skip' }
-            }
+        stage('🔨 Build Auth Service') {
             steps {
                 sh """
                     export JAVA_HOME=\${JDK_DIR}
                     export PATH=\${JAVA_HOME}/bin:\$PATH
 
-                    echo "🔨 [AUTH-SERVICE] Compilando aplicación SIN TESTS..."
+                    echo "🔨 [AUTH-SERVICE] Compilando aplicación..."
 
                     # Dar permisos de ejecución a mvnw
                     chmod +x ./mvnw
 
-                    # COMPILACIÓN SIMPLE - NO TESTS, NO JACOCO, NO PROBLEMAS
-                    echo "🔧 [AUTH-SERVICE] Configuración: Sin tests, sin JaCoCo, solo JAR"
-
-                    # Flags para deshabilitar todo lo problemático
-                    MAVEN_FLAGS="-DskipTests -Dmaven.test.skip=true -Djacoco.skip=true -Dcheckstyle.skip=true -Dspotbugs.skip=true -Dflyway.skip=true -Dspring.profiles.active="
-
-                    echo "📝 Compilando con flags: \$MAVEN_FLAGS"
-
-                    if ./mvnw clean package \$MAVEN_FLAGS -q; then
-                        echo "✅ Compilación exitosa sin tests"
-                    else
-                        echo "⚠️ Compilación falló, intentando con configuración más agresiva..."
-
-                        # Fallback 1: Con configuración offline
-                        if ./mvnw clean package \$MAVEN_FLAGS -o -q; then
-                            echo "✅ Compilación exitosa con configuración offline"
-                        else
-                            echo "⚠️ Fallback offline falló, intentando sin perfiles..."
-                            # Fallback 2: Sin perfiles y sin config server
-                            if ./mvnw clean package -DskipTests -Dmaven.test.skip=true -q; then
-                                echo "✅ Compilación exitosa con configuración mínima"
-                            else
-                                echo "❌ Compilación falló. Mostrando errores:"
-                                ./mvnw clean package -DskipTests 2>&1 | tail -20
-                                exit 1
-                            fi
-                        fi
+                    # Configurar flags de Maven
+                    MAVEN_FLAGS=""
+                    if [ "${params.SKIP_TESTS}" = "true" ]; then
+                        MAVEN_FLAGS="-DskipTests -Dmaven.test.skip=true"
+                        echo "⏩ Tests deshabilitados"
                     fi
 
-                    # ✅ DETECCIÓN SEGURA DEL JAR Y NOMBRE REAL DEL SERVICIO
-                    echo "🔍 Buscando JAR compilado y actualizando nombre del servicio..."
-                    JAR_FILE=\$(find target -name "*.jar" -not -name "*-sources.jar" -not -name "*-javadoc.jar" | head -1)
+                    # Compilar
+                    echo "📝 Ejecutando: ./mvnw clean package \$MAVEN_FLAGS"
+                    ./mvnw clean package \$MAVEN_FLAGS
 
-                    if [ -n "\$JAR_FILE" ] && [ -s "\$JAR_FILE" ]; then
-                        echo "✅ [AUTH-SERVICE] JAR encontrado: \$JAR_FILE"
-                        echo "📊 Tamaño: \$(du -h "\$JAR_FILE" | cut -f1)"
-                        ls -lh "\$JAR_FILE"
-
-                        # Extraer nombre real del servicio desde el JAR de forma segura
-                        JAR_NAME=\$(basename "\$JAR_FILE")
-                        REAL_SERVICE_NAME=\$(echo "\$JAR_NAME" | cut -d'-' -f1)
-
-                        echo "JAR_FOUND=\$JAR_NAME" > jar_info.txt
-                        echo "REAL_SERVICE_NAME=\$REAL_SERVICE_NAME" >> jar_info.txt
-                        echo "✅ JAR listo para deploy"
-                        echo "🔄 Nombre real del servicio detectado: \$REAL_SERVICE_NAME"
+                    # Verificar JAR
+                    if [ -f target/${env.AUTH_JAR_NAME} ]; then
+                        echo "✅ [AUTH-SERVICE] JAR creado exitosamente"
+                        ls -lh target/${env.AUTH_JAR_NAME}
                     else
-                        echo "❌ [AUTH-SERVICE] No se encontró JAR válido"
-                        echo "🔍 Contenido de target/:"
-                        ls -la target/ 2>/dev/null || echo "Directorio target no existe"
+                        echo "❌ [AUTH-SERVICE] Error: JAR no encontrado en la ruta esperada"
+                        echo "🔍 Buscando JAR..."
+                        find target -name "*.jar" -not -name "*-sources.jar" -not -name "*-javadoc.jar"
                         exit 1
                     fi
                 """
-
-                script {
-                    // ✅ ACTUALIZAR VARIABLES CON EL SERVICIO REAL
-                    try {
-                        if (fileExists('jar_info.txt')) {
-                            def jarInfo = readFile('jar_info.txt').trim()
-                            def lines = jarInfo.split('\n')
-
-                            for (line in lines) {
-                                if (line.contains('JAR_FOUND=')) {
-                                    def foundJarName = line.split('=')[1]
-                                    if (foundJarName && foundJarName != "") {
-                                        env.CALCULATED_JAR_NAME = foundJarName
-                                        echo "✅ [SETUP] JAR final detectado: ${env.CALCULATED_JAR_NAME}"
-                                    }
-                                }
-                                if (line.contains('REAL_SERVICE_NAME=')) {
-                                    def realServiceName = line.split('=')[1]
-                                    if (realServiceName && realServiceName != "" && realServiceName != "null") {
-                                        env.CALCULATED_SERVICE_NAME = realServiceName
-                                        env.CALCULATED_SERVICE_PATH = "/home/ubuntu/${realServiceName}"
-                                        echo "🔄 [SETUP] Nombre del servicio actualizado: ${env.CALCULATED_SERVICE_NAME}"
-                                        echo "🔄 [SETUP] Ruta actualizada: ${env.CALCULATED_SERVICE_PATH}"
-                                    }
-                                }
-                            }
-                        }
-                    } catch (Exception e) {
-                        echo "⚠️ [SETUP] Error leyendo jar_info.txt: ${e.message}"
-                    }
-                }
             }
         }
 
         stage('⚠️ Production Approval') {
             when {
-                environment name: 'DEPLOY_STRATEGY', value: 'manual-approval'
+                expression { return env.NEED_APPROVAL == 'true' }
             }
             steps {
                 script {
-                    def branchName = env.BRANCH_NAME ?: 'unknown'
-                    def buildNumber = env.BUILD_NUMBER ?: 'N/A'
-                    def javaVersion = params.JAVA_VERSION ?: '17'
-
                     echo """
 🚨 [AUTH-SERVICE] APROBACIÓN REQUERIDA PARA PRODUCCIÓN
 
 📋 Información del Deploy:
-   • Servicio: ${env.CALCULATED_SERVICE_NAME}
+   • Servicio: ${env.AUTH_SERVICE_NAME}
    • Entorno: PRODUCCIÓN
-   • Rama: ${branchName}
-   • Build: ${buildNumber}
-   • Java: ${javaVersion}
-   • Compilación: SIN TESTS (solo JAR)
-   • Puerto: Definido en Config Server
+   • Rama: ${env.GIT_BRANCH_NAME}
+   • Java: ${params.JAVA_VERSION}
 """
 
                     timeout(time: 15, unit: 'MINUTES') {
-                        def approvalResponse = input(
-                            message: "🚨 ¿Aprobar deploy de ${env.CALCULATED_SERVICE_NAME} a PRODUCCIÓN?",
+                        def approval = input(
+                            message: "🚨 ¿Aprobar deploy de ${env.AUTH_SERVICE_NAME} a PRODUCCIÓN?",
                             ok: '✅ Aprobar Deploy',
                             parameters: [
                                 choice(
                                     name: 'ACTION',
                                     choices: ['Aprobar', 'Rechazar'],
                                     description: 'Selecciona la acción'
-                                ),
-                                text(
-                                    name: 'COMMENTS',
-                                    defaultValue: '',
-                                    description: 'Comentarios adicionales (opcional)'
                                 )
                             ]
                         )
 
-                        if (approvalResponse.ACTION != 'Aprobar') {
+                        if (approval != 'Aprobar') {
                             error("❌ [AUTH-SERVICE] Deploy a producción rechazado")
                         }
 
                         echo "✅ [AUTH-SERVICE] Deploy a producción APROBADO"
-                        if (approvalResponse.COMMENTS?.trim()) {
-                            echo "💬 Comentarios: ${approvalResponse.COMMENTS}"
-                        }
                     }
                 }
             }
@@ -454,36 +237,30 @@ pipeline {
 
         stage('🚀 Deploy Auth Service') {
             when {
-                anyOf {
-                    environment name: 'DEPLOY_STRATEGY', value: 'auto'
-                    environment name: 'DEPLOY_STRATEGY', value: 'manual-approval'
-                }
+                expression { return env.DEPLOY_ENV != 'none' }
             }
             steps {
                 script {
                     def EC2_IP = ''
-                    def cleanServiceName = env.CALCULATED_SERVICE_NAME.replaceAll('[^a-zA-Z0-9-_]', '-')
-                    def targetEnv = env.TARGET_ENV ?: 'dev'
-                    def envProfile = env.ENV ?: 'dev'
 
                     // Determinar IP según entorno
-                    if (targetEnv == 'prod') {
+                    if (env.DEPLOY_ENV == 'prod') {
                         EC2_IP = env.EC2_IP_PROD
-                    } else if (targetEnv == 'qa') {
+                    } else if (env.DEPLOY_ENV == 'qa') {
                         EC2_IP = env.EC2_IP_QA
                     } else {
                         EC2_IP = env.EC2_IP_DEV
                     }
 
-                    echo "🚀 [AUTH-SERVICE] Desplegando en ${targetEnv.toUpperCase()} (${EC2_IP})"
+                    echo "🚀 [AUTH-SERVICE] Desplegando en ${env.DEPLOY_ENV.toUpperCase()} (${EC2_IP})"
 
                     // 1. Preparar servidor
                     sh """
                     echo "🔧 [AUTH-SERVICE] Preparando servidor..."
                     ssh -i \$SSH_KEY -o StrictHostKeyChecking=no -o ConnectTimeout=30 ${EC2_USER}@${EC2_IP} '
                         # Crear directorios
-                        sudo mkdir -p ${env.CALCULATED_SERVICE_PATH}
-                        sudo chown -R ubuntu:ubuntu ${env.CALCULATED_SERVICE_PATH}
+                        sudo mkdir -p ${env.AUTH_SERVICE_PATH}
+                        sudo chown -R ubuntu:ubuntu ${env.AUTH_SERVICE_PATH}
 
                         # Instalar dependencias básicas
                         which curl > /dev/null || sudo apt-get update -qq && sudo apt-get install -y curl
@@ -491,8 +268,8 @@ pipeline {
 
                         # Instalar Java si no existe
                         if ! which java > /dev/null; then
-                            echo "☕ [AUTH-SERVICE] Instalando Java ${params.JAVA_VERSION ?: '17'}..."
-                            sudo apt-get update -qq && sudo apt-get install -y openjdk-${params.JAVA_VERSION ?: '17'}-jre-headless
+                            echo "☕ [AUTH-SERVICE] Instalando Java ${params.JAVA_VERSION}..."
+                            sudo apt-get update -qq && sudo apt-get install -y openjdk-${params.JAVA_VERSION}-jre-headless
                         fi
 
                         echo "✅ [AUTH-SERVICE] Servidor preparado"
@@ -503,12 +280,12 @@ pipeline {
                     sh """
                     echo "🛑 [AUTH-SERVICE] Deteniendo servicio existente..."
                     ssh -i \$SSH_KEY -o StrictHostKeyChecking=no ${EC2_USER}@${EC2_IP} '
-                        if sudo systemctl is-active --quiet ${cleanServiceName}.service 2>/dev/null; then
-                            echo "🛑 Deteniendo servicio ${cleanServiceName}..."
-                            sudo systemctl stop ${cleanServiceName}.service
+                        if sudo systemctl is-active --quiet ${env.AUTH_SERVICE_NAME}.service 2>/dev/null; then
+                            echo "🛑 Deteniendo servicio ${env.AUTH_SERVICE_NAME}..."
+                            sudo systemctl stop ${env.AUTH_SERVICE_NAME}.service
                             sleep 5
                         else
-                            echo "ℹ️ Servicio ${cleanServiceName} no está corriendo"
+                            echo "ℹ️ Servicio ${env.AUTH_SERVICE_NAME} no está corriendo"
                         fi
                     ' || echo "⚠️ [AUTH-SERVICE] No hay servicio previo"
                     """
@@ -516,21 +293,11 @@ pipeline {
                     // 3. Copiar JAR
                     sh """
                     echo "📦 [AUTH-SERVICE] Copiando JAR..."
-
-                    # Buscar el JAR compilado dinámicamente
-                    JAR_FILE=\$(find target -name "*.jar" -not -name "*-sources.jar" -not -name "*-javadoc.jar" | head -1)
-
-                    if [ -n "\$JAR_FILE" ]; then
-                        echo "📦 Copiando JAR: \$JAR_FILE"
-                        scp -i \$SSH_KEY -o StrictHostKeyChecking=no "\$JAR_FILE" ${EC2_USER}@${EC2_IP}:${env.CALCULATED_SERVICE_PATH}/app.jar
-                        echo "✅ [AUTH-SERVICE] JAR copiado como app.jar"
-                    else
-                        echo "❌ No se encontró JAR para copiar"
-                        exit 1
-                    fi
+                    scp -i \$SSH_KEY -o StrictHostKeyChecking=no target/${env.AUTH_JAR_NAME} ${EC2_USER}@${EC2_IP}:${env.AUTH_SERVICE_PATH}/app.jar
+                    echo "✅ [AUTH-SERVICE] JAR copiado como app.jar"
                     """
 
-                    // 4. Crear servicio systemd para auth-service
+                    // 4. Crear servicio systemd
                     def systemdService = """[Unit]
 Description=Spring Boot Auth Service
 After=network.target
@@ -541,11 +308,11 @@ After=network-online.target
 Type=simple
 User=ubuntu
 Group=ubuntu
-WorkingDirectory=${env.CALCULATED_SERVICE_PATH}
-ExecStart=/usr/bin/java -jar ${env.CALCULATED_SERVICE_PATH}/app.jar \\
-    --spring.profiles.active=${envProfile} \\
+WorkingDirectory=${env.AUTH_SERVICE_PATH}
+ExecStart=/usr/bin/java -jar ${env.AUTH_SERVICE_PATH}/app.jar \\
+    --spring.profiles.active=${env.DEPLOY_ENV} \\
     --logging.level.root=INFO \\
-    --logging.file.name=${env.CALCULATED_SERVICE_PATH}/${cleanServiceName}.log
+    --logging.file.name=${env.AUTH_SERVICE_PATH}/${env.AUTH_SERVICE_NAME}.log
 
 # Configuración de reinicio
 Restart=on-failure
@@ -555,15 +322,15 @@ SuccessExitStatus=143
 # Logging
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=${cleanServiceName}
+SyslogIdentifier=${env.AUTH_SERVICE_NAME}
 
 # Seguridad
 NoNewPrivileges=true
 PrivateTmp=true
 
 # Variables de entorno
-Environment=JAVA_HOME=/usr/lib/jvm/java-${params.JAVA_VERSION ?: '17'}-openjdk-amd64
-Environment=SPRING_PROFILES_ACTIVE=${envProfile}
+Environment=JAVA_HOME=/usr/lib/jvm/java-${params.JAVA_VERSION}-openjdk-amd64
+Environment=SPRING_PROFILES_ACTIVE=${env.DEPLOY_ENV}
 
 [Install]
 WantedBy=multi-user.target"""
@@ -573,7 +340,7 @@ WantedBy=multi-user.target"""
                     echo "⚙️ [AUTH-SERVICE] Configurando servicio systemd..."
 
                     # Crear archivo de servicio
-                    echo '${systemdService}' | ssh -i \$SSH_KEY -o StrictHostKeyChecking=no ${EC2_USER}@${EC2_IP} 'sudo tee /etc/systemd/system/${cleanServiceName}.service > /dev/null'
+                    echo '${systemdService}' | ssh -i \$SSH_KEY -o StrictHostKeyChecking=no ${EC2_USER}@${EC2_IP} 'sudo tee /etc/systemd/system/${env.AUTH_SERVICE_NAME}.service > /dev/null'
 
                     # Configurar e iniciar servicio
                     ssh -i \$SSH_KEY -o StrictHostKeyChecking=no ${EC2_USER}@${EC2_IP} '
@@ -581,45 +348,41 @@ WantedBy=multi-user.target"""
                         sudo systemctl daemon-reload
 
                         # Habilitar auto-inicio
-                        sudo systemctl enable ${cleanServiceName}.service
+                        sudo systemctl enable ${env.AUTH_SERVICE_NAME}.service
 
                         # Iniciar servicio
-                        sudo systemctl start ${cleanServiceName}.service
+                        sudo systemctl start ${env.AUTH_SERVICE_NAME}.service
 
                         # Verificar inicio
                         sleep 15
-                        if sudo systemctl is-active --quiet ${cleanServiceName}.service; then
+                        if sudo systemctl is-active --quiet ${env.AUTH_SERVICE_NAME}.service; then
                             echo "✅ [AUTH-SERVICE] Servicio iniciado correctamente"
-                            sudo systemctl status ${cleanServiceName}.service --no-pager -l
+                            sudo systemctl status ${env.AUTH_SERVICE_NAME}.service --no-pager -l
                         else
                             echo "❌ [AUTH-SERVICE] Error al iniciar servicio"
-                            sudo systemctl status ${cleanServiceName}.service --no-pager -l
-                            sudo journalctl -u ${cleanServiceName}.service --since \"5 minutes ago\" --no-pager
+                            sudo systemctl status ${env.AUTH_SERVICE_NAME}.service --no-pager -l
+                            sudo journalctl -u ${env.AUTH_SERVICE_NAME}.service --since \"5 minutes ago\" --no-pager
                             exit 1
                         fi
                     '
                     """
 
-                    echo "✅ [AUTH-SERVICE] Deploy completado en ${targetEnv.toUpperCase()}!"
+                    echo "✅ [AUTH-SERVICE] Deploy completado en ${env.DEPLOY_ENV.toUpperCase()}!"
                 }
             }
         }
 
-        stage('🔍 Health Check & Verification') {
+        stage('🔍 Health Check') {
             when {
-                anyOf {
-                    environment name: 'DEPLOY_STRATEGY', value: 'auto'
-                    environment name: 'DEPLOY_STRATEGY', value: 'manual-approval'
-                }
+                expression { return env.DEPLOY_ENV != 'none' }
             }
             steps {
                 script {
                     def EC2_IP = ''
-                    def cleanServiceName = env.CALCULATED_SERVICE_NAME.replaceAll('[^a-zA-Z0-9-_]', '-')
 
-                    if (env.TARGET_ENV == 'prod') {
+                    if (env.DEPLOY_ENV == 'prod') {
                         EC2_IP = env.EC2_IP_PROD
-                    } else if (env.TARGET_ENV == 'qa') {
+                    } else if (env.DEPLOY_ENV == 'qa') {
                         EC2_IP = env.EC2_IP_QA
                     } else {
                         EC2_IP = env.EC2_IP_DEV
@@ -628,21 +391,21 @@ WantedBy=multi-user.target"""
                     echo "🔍 [AUTH-SERVICE] Verificando deploy..."
 
                     // Esperar inicio completo
-                    sh "sleep 45"
+                    sh "sleep 30"
 
-                    // Verificaciones completas
+                    // Verificaciones
                     sh """
                     ssh -i \$SSH_KEY -o StrictHostKeyChecking=no ${EC2_USER}@${EC2_IP} '
                         echo "📊 [AUTH-SERVICE] Estado del servicio:"
-                        sudo systemctl status ${cleanServiceName}.service --no-pager
+                        sudo systemctl status ${env.AUTH_SERVICE_NAME}.service --no-pager
 
                         echo "🔌 [AUTH-SERVICE] Detectando puerto del servicio..."
-                        # Detectar el puerto que está usando el servicio
-                        SERVICE_PORT=\$(sudo journalctl -u ${cleanServiceName}.service --since \"10 minutes ago\" --no-pager | grep -o "Tomcat started on port(s): [0-9]*" | grep -o "[0-9]*" | tail -1)
+                        # Detectar el puerto
+                        SERVICE_PORT=\$(sudo journalctl -u ${env.AUTH_SERVICE_NAME}.service --since \"10 minutes ago\" --no-pager | grep -o "Tomcat started on port(s): [0-9]*" | grep -o "[0-9]*" | tail -1)
 
                         if [ -z "\$SERVICE_PORT" ]; then
-                            # Fallback: buscar cualquier puerto que esté escuchando el proceso Java
-                            SERVICE_PID=\$(sudo systemctl show --property MainPID --value ${cleanServiceName}.service)
+                            # Fallback: buscar puerto del proceso Java
+                            SERVICE_PID=\$(sudo systemctl show --property MainPID --value ${env.AUTH_SERVICE_NAME}.service)
                             if [ "\$SERVICE_PID" != "0" ] && [ -n "\$SERVICE_PID" ]; then
                                 SERVICE_PORT=\$(sudo netstat -tlnp 2>/dev/null | grep "\$SERVICE_PID/java" | awk "{print \$4}" | cut -d: -f2 | head -1)
                             fi
@@ -651,24 +414,17 @@ WantedBy=multi-user.target"""
                         if [ -n "\$SERVICE_PORT" ]; then
                             echo "✅ Puerto detectado: \$SERVICE_PORT"
 
-                            echo "🏥 [AUTH-SERVICE] Verificando health endpoint..."
-                            for i in {1..15}; do
-                                if curl -f http://localhost:\$SERVICE_PORT/actuator/health 2>/dev/null; then
-                                    echo "✅ Health Check: PASSED"
-                                    curl -s http://localhost:\$SERVICE_PORT/actuator/health | head -5
-                                    break
-                                fi
-                                echo "⏳ Esperando health endpoint... (\$i/15)"
-                                sleep 10
-                            done
+                            # Verificar health endpoint
+                            echo "🏥 Verificando health endpoint..."
+                            curl -s http://localhost:\$SERVICE_PORT/actuator/health
 
-                            echo "🌐 [AUTH-SERVICE] Verificando endpoints importantes..."
-                            # Verificar swagger
-                            curl -s http://localhost:\$SERVICE_PORT/v3/api-docs 2>/dev/null | grep -q "openapi" && \
-                                echo "✅ Swagger disponible" || echo "⚠️ Swagger no disponible"
+                            # Verificar endpoints auth
+                            echo -e "\n🔐 Verificando endpoints auth..."
+                            curl -s -o /dev/null -w "Auth endpoint HTTP status: %{http_code}\n" http://localhost:\$SERVICE_PORT/auth/authenticate
 
-                            # Verificar auth endpoints
-                            curl -s http://localhost:\$SERVICE_PORT/auth/authenticate -o /dev/null -w "Auth Endpoints: %{http_code}\\n"
+                            # Guardar puerto en archivo para futuras referencias
+                            echo "\$SERVICE_PORT" > ${env.AUTH_SERVICE_PATH}/service_port.txt
+                            echo "✅ Puerto guardado en ${env.AUTH_SERVICE_PATH}/service_port.txt"
                         else
                             echo "⚠️ No se pudo detectar el puerto del servicio"
                             echo "🔍 Puertos activos:"
@@ -676,9 +432,7 @@ WantedBy=multi-user.target"""
                         fi
 
                         echo "📄 [AUTH-SERVICE] Últimos logs del servicio:"
-                        sudo journalctl -u ${cleanServiceName}.service --since \"5 minutes ago\" --no-pager | tail -20
-
-                        echo "✅ [AUTH-SERVICE] Verificación completada"
+                        sudo journalctl -u ${env.AUTH_SERVICE_NAME}.service --since \"5 minutes ago\" --no-pager | tail -20
                     '
                     """
                 }
@@ -689,32 +443,26 @@ WantedBy=multi-user.target"""
     post {
         success {
             script {
-                def deployStrategy = env.DEPLOY_STRATEGY ?: 'N/A'
-                def branchName = env.BRANCH_NAME ?: 'unknown'
-                def targetEnv = env.TARGET_ENV ?: 'unknown'
-
-                if (deployStrategy && deployStrategy != 'compile-only') {
+                if (env.DEPLOY_ENV != 'none') {
                     def EC2_IP = ''
-                    def cleanServiceName = env.CALCULATED_SERVICE_NAME.replaceAll('[^a-zA-Z0-9-_]', '-')
 
-                    if (targetEnv == 'prod') {
+                    if (env.DEPLOY_ENV == 'prod') {
                         EC2_IP = env.EC2_IP_PROD
-                    } else if (targetEnv == 'qa') {
+                    } else if (env.DEPLOY_ENV == 'qa') {
                         EC2_IP = env.EC2_IP_QA
                     } else {
                         EC2_IP = env.EC2_IP_DEV
                     }
 
                     echo """
-🎉 [AUTH-SERVICE] ¡DEPLOY EXITOSO EN ${targetEnv.toUpperCase()}!
+🎉 [AUTH-SERVICE] ¡DEPLOY EXITOSO EN ${env.DEPLOY_ENV.toUpperCase()}!
 
 📋 Información del servicio:
-   • Nombre: ${env.CALCULATED_SERVICE_NAME}
+   • Nombre: ${env.AUTH_SERVICE_NAME}
    • Servidor: ${EC2_IP}
-   • Systemd Service: ${cleanServiceName}.service
-   • Java Version: ${params.JAVA_VERSION ?: '17'}
-   • Compilación: SIN TESTS (solo JAR optimizado)
-   • Puerto: Configurado en Config Server
+   • Systemd Service: ${env.AUTH_SERVICE_NAME}.service
+   • Java Version: ${params.JAVA_VERSION}
+   • Entorno: ${env.DEPLOY_ENV}
 
 🌐 API Endpoints:
    • Base URL: http://${EC2_IP}:[PUERTO]
@@ -723,46 +471,35 @@ WantedBy=multi-user.target"""
    • Health: http://${EC2_IP}:[PUERTO]/actuator/health
 
 🛠️ Comandos de gestión:
-   • Estado: sudo systemctl status ${cleanServiceName}.service
-   • Logs: sudo journalctl -u ${cleanServiceName}.service -f
-   • Restart: sudo systemctl restart ${cleanServiceName}.service
-   • Stop: sudo systemctl stop ${cleanServiceName}.service
-   • Detectar puerto: sudo journalctl -u ${cleanServiceName}.service | grep "Tomcat started on port"
+   • Estado: sudo systemctl status ${env.AUTH_SERVICE_NAME}.service
+   • Logs: sudo journalctl -u ${env.AUTH_SERVICE_NAME}.service -f
+   • Restart: sudo systemctl restart ${env.AUTH_SERVICE_NAME}.service
+   • Stop: sudo systemctl stop ${env.AUTH_SERVICE_NAME}.service
 
 ✅ Auto-inicio habilitado
 """
                 } else {
-                    echo "✅ [AUTH-SERVICE] Compilación exitosa SIN TESTS - Rama: ${branchName}"
+                    echo "✅ [AUTH-SERVICE] Compilación exitosa - Sin despliegue"
                 }
             }
         }
 
         failure {
-            script {
-                def deployStrategy = env.DEPLOY_STRATEGY ?: 'N/A'
-                def branchName = env.BRANCH_NAME ?: 'unknown'
-                def buildNumber = env.BUILD_NUMBER ?: 'N/A'
-                def cleanServiceName = env.CALCULATED_SERVICE_NAME.replaceAll('[^a-zA-Z0-9-_]', '-')
-
-                echo """
+            echo """
 ❌ [AUTH-SERVICE] PIPELINE FALLIDO
 
 🔍 Información:
-   • Servicio: ${env.CALCULATED_SERVICE_NAME}
-   • Rama: ${branchName}
-   • Estrategia: ${deployStrategy}
-   • Build: ${buildNumber}
+   • Servicio: ${env.AUTH_SERVICE_NAME}
+   • Rama: ${env.GIT_BRANCH_NAME ?: 'desconocida'}
+   • Entorno: ${env.DEPLOY_ENV ?: 'ninguno'}
 
-🛠️ Comandos para debug:
-   • Ver logs: sudo journalctl -u ${cleanServiceName}.service
-   • Estado: sudo systemctl status ${cleanServiceName}.service
+🛠️ Revisar logs para más detalles
 """
-            }
         }
 
         cleanup {
             sh '''
-                rm -rf jdk*.tar.gz jdk.tar.gz jar_info.txt || true
+                rm -rf jdk*.tar.gz jdk.tar.gz || true
                 echo "✅ Limpieza completada"
             '''
         }
